@@ -1,0 +1,100 @@
+import os
+import json
+import random
+
+import numpy as np
+import torch
+from torch.utils.data import Dataset
+from PIL import Image
+from src.transforms.functional import rgb_to_ycbcr,ycbcr2rgb
+
+class bvidvcFolder(Dataset):
+    def __init__(self, root, root_folder_path, patch_h, patch_w, frame_num, crop_method='center',
+                 max_zoom_factor=1.0, min_zoom_factor=1.0, random_flip=False,
+                 frame_selection='random', max_frame_distance=6, disable_random=False, Pyuv444=False):
+        
+        self.root = root
+        self.seq = np.load(root_folder_path)
+        self.seq_length = len(self.seq)
+        self.patch_h = patch_h
+        self.patch_w = patch_w
+        self.frame_num = frame_num
+        self.crop_method = crop_method
+        assert max_zoom_factor >= min_zoom_factor
+        self.random_flip = random_flip
+        self.frame_selection = frame_selection
+        self.Pyuv444 = Pyuv444
+
+
+    def set_frame_num(self, frame_num):
+        self.frame_num = frame_num
+
+    def get_frame_num(self):
+        return self.frame_num
+
+    def __getitem__(self, index):
+        first_frame_path = self.root+self.seq[index]+"/im0.png"
+        height = 256
+        width = 256
+        img_indexes = []
+        if self.frame_selection == 'fix':
+            start_index = random.randint(0, 64 - self.frame_num) 
+            img_indexes = [i for i in range(start_index,start_index+self.frame_num)]
+        elif self.frame_selection == 'random':  
+            # s = random.randint(0, 1) 
+            s = 0
+            if s ==0:
+                start_index = random.randint(0, 64 - self.frame_num) 
+                img_indexes = [i for i in range(start_index,start_index+self.frame_num)]
+            else:
+                start_index = random.randint(0, 64 - 2*self.frame_num) 
+                img_indexes = np.arange(start_index, start_index+2*self.frame_num, 2)
+        else:
+            assert False
+        
+
+        scaled_width = width
+        scaled_height = height
+        flip = False
+        if self.random_flip:
+            flip = random.choice([True, False])
+
+        pad_height = self.patch_h - scaled_height
+        pad_width = self.patch_w - scaled_width
+        pad_height = max(0, pad_height)
+        pad_width = max(0, pad_width)
+        pad_size = ((0, 0),
+                    (pad_height // 2, pad_height - pad_height // 2),
+                    (pad_width // 2, pad_width - pad_width // 2))
+        padded_height = scaled_height + pad_height
+        padded_width = scaled_width + pad_width
+        if self.crop_method == 'center':
+            y = (padded_height - self.patch_h) // 2
+            x = (padded_width - self.patch_w) // 2
+        elif self.crop_method == 'random':
+            y = random.randint(0, padded_height - self.patch_h)
+            x = random.randint(0, padded_width - self.patch_w)
+        else:
+            assert False
+        video_data = []
+        for img_index in img_indexes:
+            img_path = first_frame_path.replace('im0', 'im' + str(img_index))
+            img = Image.open(img_path).convert("RGB")
+
+            if flip:
+                img = img.transpose(Image.FLIP_LEFT_RIGHT)
+            img = np.array(img).transpose(2, 0, 1).astype(np.uint8)
+            img = np.pad(img, pad_size, mode='constant')
+
+            img = img[:, y:y+self.patch_h, x:x+self.patch_w]
+            #######################
+            img = img.astype(np.float32) / 255.0
+            #rgb to yuv444
+            if self.Pyuv444:
+                img = rgb_to_ycbcr(img)
+            #######################
+            video_data.append(img)
+        video_data = np.concatenate(video_data, axis=0)
+        return torch.as_tensor(video_data.astype(np.float32), dtype=torch.float32)
+    def __len__(self):
+            return self.seq_length

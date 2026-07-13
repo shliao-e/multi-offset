@@ -1,0 +1,8 @@
+*.pth
+*.pt
+*.bin
+*.safetensors
+*.onnx
+*.h5
+*.ckpt
+*.tar
