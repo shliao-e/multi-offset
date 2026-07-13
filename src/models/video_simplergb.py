@@ -15,10 +15,10 @@ import lpips
 from pytorch_msssim import ms_ssim
 
 g_ch_src_d = 3 * 8 * 8
-g_ch_recon = 192
-g_ch_y = 128
+g_ch_recon = 384
+g_ch_y =  256
 g_ch_z = 128
-g_ch_d = 128
+g_ch_d =  256
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -79,6 +79,10 @@ class Local_Align(nn.Module):
                        bias=self.bias, stride=self.stride, dilation=self.dilation)
         return out
 
+class Offsetnet(nn.Module):
+    def __init__(self, c=192):
+        super().__init__()  
+
 
 class Offsetenc(nn.Module):
     def __init__(self, c=192):
@@ -106,6 +110,7 @@ class FeatureExtractor(nn.Module):
     def __init__(self, input_channel, channel,inplace=False):
         super().__init__()
         self.layer1 = nn.Sequential(DepthConvBlock(input_channel, channel, inplace=inplace),
+                                    DepthConvBlock(channel, channel, inplace=inplace),
                                     DepthConvBlock(channel, channel, inplace=inplace),
                                     )
         self.layer2 = nn.Sequential(DepthConvBlock(channel, channel, inplace=inplace),
@@ -173,13 +178,19 @@ class ReconGeneration(nn.Module):
             # DepthConvBlock(g_ch_recon, g_ch_recon),
         )
         self.recon = nn.Conv2d(g_ch_recon, g_ch_src_d, 1)
-
+        self.refine_net = nn.Sequential(
+            nn.Conv2d(3, 16, kernel_size=3, stride=1, padding=1),
+            nn.LeakyReLU(inplace=inplace),
+            nn.Conv2d(16, 3, kernel_size=3, stride=1, padding=1)
+        )
     def forward(self, x,quant_step):
         out = self.layer1(x)
         out = out * quant_step
         out = self.recon(out)
         out = F.pixel_shuffle(out, 8)
-        out = torch.clamp(out, 0., 1.)
+        out_upsampled = F.interpolate(out, scale_factor=2, mode='bilinear')
+        out_final = out_upsampled + self.refine_net(out_upsampled)
+        out = torch.clamp(out_final, 0., 1.)
         return out
 
 class Feature_adaptorX(nn.Module):
@@ -206,32 +217,38 @@ class DMC(CompressionModel):
         super().__init__(y_distribution='laplace', z_channel=g_ch_z, mv_z_channel=64,
                          ec_thread=ec_thread, stream_part=stream_part)
         self.Feature_adaptor_X = Feature_adaptorX()
-        # self.Multi_fusion = Multi_scale_ref_fusion()
         self.Feature_adaptor_I = nn.Sequential(
             DepthConvBlock(g_ch_src_d, g_ch_d, inplace=inplace),
             DepthConvBlock(g_ch_d, g_ch_d, inplace=inplace),
         )
         self.encoder = encoder(g_ch_d, g_ch_y, inplace=inplace)
         self.decoder = decoder()
+        self.downsample_conv = nn.Sequential(
+                nn.Conv2d(3, 12, kernel_size=5, stride=1, padding=2, bias=True),
+                nn.LeakyReLU(inplace=inplace),
+                nn.Conv2d(12, 3, kernel_size=3, stride=2, padding=1, bias=True) # 真正执行 2x 降采样
+            )
         self.Offsetnet = nn.Sequential(
             DepthConvBlock(g_ch_y*2, g_ch_y),
-            DepthConvBlock(g_ch_y, g_ch_y),
-            DepthConvBlock(g_ch_y, g_ch_y),
+            DepthConvBlock(g_ch_y, g_ch_z),
+            # DepthConvBlock(g_ch_y, g_ch_y),
+            # DepthConvBlock(g_ch_y, g_ch_y),
+            
         )
 
         self.offset_enc = nn.Sequential(
-            nn.Conv2d(g_ch_y, g_ch_y, 3, 2, 1),
-            DepthConvBlock(g_ch_y, g_ch_y),
-            DepthConvBlock(g_ch_y, g_ch_y),
-            DepthConvBlock(g_ch_y, g_ch_y),
-            nn.Conv2d(g_ch_y, g_ch_y, 3, 2, 1),
+            nn.Conv2d(g_ch_z, g_ch_z, 3, 2, 1),
+            DepthConvBlock(g_ch_z, g_ch_z),
+            DepthConvBlock(g_ch_z, g_ch_z),
+            nn.Conv2d(g_ch_z, g_ch_z, 3, 2, 1),
         )
         self.offset_dec = nn.Sequential(
             # SubpelConv2x(g_ch_y, g_ch_y, 3, padding=1),
-            ResidualBlockUpsample(g_ch_y, g_ch_y),
-            ResidualBlockUpsample(g_ch_y, g_ch_y),
-            DepthConvBlock(g_ch_y, g_ch_y),
-            nn.Conv2d(g_ch_y, 32, 3, 1, 1)
+            ResidualBlockUpsample(g_ch_z, g_ch_z),
+            DepthConvBlock(g_ch_z, g_ch_z),
+            ResidualBlockUpsample(g_ch_z, g_ch_z),
+            DepthConvBlock(g_ch_z, g_ch_z),
+            nn.Conv2d(g_ch_z, 32, 3, 1, 1)
             )
         self.recon_frame= ReconGeneration()
         self.align = Local_Align()
@@ -239,22 +256,24 @@ class DMC(CompressionModel):
         self.hyper_enc = nn.Sequential(
                             DepthConvBlock(g_ch_y, g_ch_z),
                             ResidualBlockWithStride2(g_ch_z, g_ch_z),
-                            ResidualBlockWithStride2(g_ch_z, g_ch_z),
-                            DepthConvBlock(g_ch_y, g_ch_z),
-                            DepthConvBlock(g_ch_y, g_ch_z),
+                            # ResidualBlockWithStride2(g_ch_z, g_ch_z),
+                            DepthConvBlock(g_ch_z, g_ch_z),
+                            DepthConvBlock(g_ch_z, g_ch_z),
                         )
         self.hyper_dec = nn.Sequential(
                             ResidualBlockUpsample(g_ch_z, g_ch_z),
-                            ResidualBlockUpsample(g_ch_z, g_ch_z),
-                            DepthConvBlock(g_ch_z, g_ch_y),
+                            # ResidualBlockUpsample(g_ch_z, g_ch_z),
+                            DepthConvBlock(g_ch_z, g_ch_z),
+                            DepthConvBlock(g_ch_z, g_ch_z),
                             )
         self.temporal_enc = nn.Sequential(
-            DepthConvBlock(g_ch_y * 2, g_ch_y, inplace=inplace),
-            # DepthConvBlock(g_ch_y, g_ch_y, inplace=inplace),
+            DepthConvBlock(g_ch_y * 2, g_ch_y*2, inplace=inplace),
+            DepthConvBlock(g_ch_y * 2, g_ch_y*2, inplace=inplace),
+            DepthConvBlock(g_ch_y*2, g_ch_y, inplace=inplace),
         )
         self.prior_fusion_1 = nn.Sequential(
+            DepthConvBlock(g_ch_y +g_ch_z, g_ch_y*2, inplace=inplace),
             DepthConvBlock(g_ch_y * 2, g_ch_y*2, inplace=inplace),
-            # DepthConvBlock(g_ch_y*3, g_ch_y*2, inplace=inplace),
         )
 
         self.enc_Vector = nn.Parameter(torch.ones((1, g_ch_d, 1, 1)))
@@ -307,11 +326,10 @@ class DMC(CompressionModel):
         vector_offset2 = self.get_curr_q(offset_Vector2, self.hyper_offset2, q_index=q_index)
 
         return vector_enc,vector_dec,vector_rec,vector_tem,vector_hyper1,vector_hyper2,vector_offset1,vector_offset2
-    
     def get_offset_enc_dec(self, ref_feature,feature_8,vector_offset1,vector_offset2):
-        d_ref_feature = F.interpolate(ref_feature,scale_factor=0.5,mode='bilinear')
-        d_feature = F.interpolate(feature_8,scale_factor=0.5,mode='bilinear')
-        offset = self.Offsetnet(torch.cat([d_ref_feature,d_feature],dim=1))
+        # d_ref_feature = F.interpolate(ref_feature,scale_factor=0.5,mode='bilinear')
+        # d_feature = F.interpolate(feature_8,scale_factor=0.5,mode='bilinear')
+        offset = self.Offsetnet(torch.cat([ref_feature, feature_8],dim=1))  
         offset_latent = self.offset_enc(offset)
         offset_latent_scale = offset_latent*vector_offset1
         offset_latent_q = self.quant(offset_latent_scale)
@@ -319,17 +337,19 @@ class DMC(CompressionModel):
         offset_hat = 6.0 * torch.tanh(
                             self.offset_dec(offset_latent_hat)
                         )
-        offset_hat = F.interpolate(offset_hat,scale_factor=2,mode='bilinear')
+        # offset_hat = F.interpolate(offset_hat,scale_factor=2,mode='bilinear')
         return offset_hat,offset_latent_q
 
     def forward_one_frame(self, x, dpb, frame_idx,use_lpip):
         _, _, H, W = x.size()
         pixel_num = H * W
+        x_d = self.downsample_conv(x)
         vector_enc,vector_dec,vector_rec,vector_tem,vector_hyper1, vector_hyper2,vector_offset1,vector_offset2 = self.get_q_for_inference(frame_idx)
         
-        feature = F.pixel_unshuffle(x, 8)
-        feature_8 = self.Feature_adaptor_X(x)
-        feature_I = F.pixel_unshuffle(dpb["ref_frame"], 8)
+        feature = F.pixel_unshuffle(x_d, 8)
+        feature_8 = self.Feature_adaptor_X(x_d)
+        ref_d = self.downsample_conv(dpb["ref_frame"])
+        feature_I = F.pixel_unshuffle(ref_d , 8)
         if dpb['ref_feature'] is not None:
             ref_feature = dpb['ref_feature']
         else:
@@ -337,7 +357,11 @@ class DMC(CompressionModel):
 
         offset_hat,offset_latent_q = self.get_offset_enc_dec(ref_feature,feature_8,vector_offset1,vector_offset2)
         ctx = self.align(ref_feature,offset_hat)
-
+        # self.captured_offset = {
+        #         'offset_hat': offset_hat.detach().cpu(),  # [B, 32, H/4, W/4]
+        #         'offset_latent_q': offset_latent_q.detach().cpu(),  # [B, 128, H/64, W/64]
+        #         'frame_idx': frame_idx,
+        #     }
         F_tem,F_tem_e = self.feature_extractor(ctx,vector_tem,frame_idx)
         y = self.encoder(feature,feature_8,F_tem,vector_enc)
         z= self.hyper_enc(y)
@@ -370,6 +394,7 @@ class DMC(CompressionModel):
         bits_y = self.get_y_laplace_bits(y_for_bit, scale)
         bits_z = self.get_z_bits(z_for_bit, self.bit_estimator_z)
         bits_offset = self.get_z_bits(offset_for_bit, self.bit_estimator_offset)
+        bits = torch.sum(bits_y, dim=(1, 2, 3))+torch.sum(bits_z, dim=(1, 2, 3))+torch.sum(bits_offset, dim=(1, 2, 3))
         bpp_y = torch.sum(bits_y, dim=(1, 2, 3)) / pixel_num
         bpp_z = torch.sum(bits_z, dim=(1, 2, 3)) / pixel_num
         bpp_offset = torch.sum(bits_offset, dim=(1, 2, 3)) / pixel_num
@@ -404,43 +429,46 @@ class DMC(CompressionModel):
                 },
                 "bit_y": bits_y,
                 "bit_z": bits_z,
+                "bits":bits
                 }
         
     def cal_macs(self):
         from ..utils.common import flops_calculator
         vector_enc,vector_dec,vector_rec,vector_tem,vector_hyper1, vector_hyper2,vector_offset1,vector_offset2 =  self.get_q_for_inference(0)
+        pixels =  256 * 256
         x = torch.randn(1, 3, 256, 256)
-        f = torch.randn(1, g_ch_src_d, 32, 32)
-        f1 = torch.randn(1, g_ch_d, 32, 32)
-
-        offset = torch.randn(1,32, 32, 32)
-        offset_latent = torch.randn(1,g_ch_y, 4, 4)
-        y = torch.randn(1, g_ch_y, 16, 16)
+        x_d = torch.randn(1, 3, 128, 128)
+        f = torch.randn(1, g_ch_src_d, 16, 16)
+        f1 = torch.randn(1, g_ch_d, 16, 16)
+        offset_feature = torch.randn(1,g_ch_z, 16, 16)
+        offset = torch.randn(1,32, 16, 16)
+        offset_latent = torch.randn(1,g_ch_z, 4, 4)
+        y = torch.randn(1, g_ch_y, 8, 8)
         z = torch.randn(1, g_ch_z, 4, 4)
         f4 = torch.randn(1, g_ch_y*2, 16, 16)
-        f5 = torch.randn(1, g_ch_y*2, 32, 32)
-        pixels = 256 * 256
-        
+        f5 = torch.randn(1, g_ch_y*2, 8, 8)
+        f6 = torch.randn(1, g_ch_y+g_ch_z, 8, 8)
         
         msgs = {
 
-            'Feature_adaptor_X': flops_calculator(pixels,  self.Feature_adaptor_X, x),
+            'Feature_adaptor_X': flops_calculator(pixels,  self.Feature_adaptor_X, x_d),
             'Feature_adaptor_I': flops_calculator(pixels,  self.Feature_adaptor_I, f),
             'feature_extractor': flops_calculator(pixels,  self.feature_extractor, f1,vector_tem),
+            'downsample_conv': flops_calculator(pixels,  self.downsample_conv, x ),
             'encoder': flops_calculator(pixels,  self.encoder, f,f1,f1,vector_enc),
             'hyper_enc': flops_calculator(pixels,  self.hyper_enc, y),
             'hyper_dec': flops_calculator(pixels,  self.hyper_dec, z),
             'offset_net': flops_calculator(pixels,  self.Offsetnet,f4),
-            'offset_enc': flops_calculator(pixels,  self.offset_enc,y),
+            'offset_enc': flops_calculator(pixels,  self.offset_enc,offset_feature),
             'offset_dec': flops_calculator(pixels,  self.offset_dec,offset_latent),
             'align': flops_calculator(pixels,  self.align,f1,offset),
-            'prior_fusion_1': flops_calculator(pixels,  self.prior_fusion_1, f4),
-            'temporal_enc': flops_calculator(pixels,  self.temporal_enc, f4),
+            'prior_fusion_1': flops_calculator(pixels,  self.prior_fusion_1, f6),
+            'temporal_enc': flops_calculator(pixels,  self.temporal_enc, f5),
             'decoder': flops_calculator(pixels,  self.decoder, y,f1,vector_dec),
             'recon_frame': flops_calculator(pixels,  self.recon_frame, f1,vector_rec),  
         }
-        enc_models_i = ['Feature_adaptor_X','Feature_adaptor_I', 'feature_extractor', 'encoder','decoder','hyper_enc','hyper_dec','temporal_enc','prior_fusion_1', 'offset_enc', 'offset_dec','offset_net','align']
-        enc_models =  ['Feature_adaptor_X', 'feature_extractor', 'encoder','decoder','hyper_enc','hyper_dec','temporal_enc','prior_fusion_1', 'offset_enc', 'offset_dec','offset_net','align']
+        enc_models_i = ['Feature_adaptor_X','Feature_adaptor_I', 'feature_extractor', 'encoder','decoder','hyper_enc','hyper_dec','temporal_enc','prior_fusion_1', 'offset_enc', 'offset_dec','offset_net','align','downsample_conv']
+        enc_models =  ['Feature_adaptor_X', 'feature_extractor', 'encoder','decoder','hyper_enc','hyper_dec','temporal_enc','prior_fusion_1', 'offset_enc', 'offset_dec','offset_net','align','downsample_conv']
         dec_models_i = ['Feature_adaptor_I', 'feature_extractor','decoder','prior_fusion_1','hyper_dec','recon_frame','temporal_enc', 'offset_dec','offset_net','align']
         dec_models_p = ['feature_extractor','decoder','prior_fusion_1','hyper_dec','recon_frame','temporal_enc', 'offset_dec','offset_net','align']
         total_Enc_flops = 0
@@ -481,7 +509,199 @@ class DMC(CompressionModel):
         msgs['Dec_i'] = str(total_Dec_i_flops / 1000) + ' KMac'
         msgs['Dec_p'] = str(total_Dec_p_flops / 1000) + ' KMac'
         return msgs
-    
+    def encode_decode(self, x, dpb, output_path=None,
+                      pic_width=None, pic_height=None, frame_idx=0,use_lpip = True):
+        device = x.device
+        torch.cuda.synchronize(device=device)
+        t0 = time.time()
+        B,C,H,W = x.size()
+        encoded = self.compress(x, dpb, frame_idx)
+        encode_p(encoded['bit_stream'], frame_idx, output_path)
+        bits = filesize(output_path) * 8
+        torch.cuda.synchronize(device=device)
+        t1 = time.time()  
+          
+        frame_idx, string = decode_p(output_path)
+        decoded = self.decompress(dpb, string, pic_height, pic_width,
+                                   frame_idx)
+        torch.cuda.synchronize(device=device)
+        t2 = time.time()
+        pixel_num = H * W
+        bpp = bits/ pixel_num
+        mse_loss =  torch.mean((decoded["dpb"]['ref_frame'] - x).pow(2))
+        result = {
+            "dpb": decoded["dpb"],
+            "bit": bits,
+            'bpp': bpp,
+            'mse_loss':mse_loss,
+            "encoding_time": t1 - t0,
+            "decoding_time": t2 - t1,
+        }
+        return result 
+    def decode(self, x, dpb, output_path=None,
+                      pic_width=None, pic_height=None):
+        device = x.device
+        torch.cuda.synchronize(device=device)
+        t0 = time.time()
+        B,C,H,W = x.size()
+        bits = filesize(output_path) * 8
+        torch.cuda.synchronize(device=device)
+        t1 = time.time()
+        frame_idx, string = decode_p(output_path)
+        decoded = self.decompress(dpb, string, pic_height, pic_width,
+                                   frame_idx)
+        torch.cuda.synchronize(device=device)
+        t2 = time.time()
+        pixel_num = H * W
+        bpp = bits/ pixel_num
+        mse_loss =  torch.mean((decoded["dpb"]['ref_frame'] - x).pow(2))
+        result = {
+            "dpb": decoded["dpb"],
+            "bit": bits,
+            'bpp': bpp,
+            'mse_loss':mse_loss,
+            "encoding_time": t1 - t0,
+            "decoding_time": t2 - t1,
+        }
+        return result 
+    def compress(self, x, dpb, frame_idx):
+        # 1. Unpack all 8 vectors matching the new architecture
+        vector_enc, vector_dec, vector_rec, vector_tem, vector_hyper1, vector_hyper2, vector_offset1, vector_offset2 = self.get_q_for_inference(frame_idx)
+        
+        # 2. Pixel unshuffle and feature extraction matching forward_one_frame
+        feature = F.pixel_unshuffle(x, 8)
+        feature_8 = self.Feature_adaptor_X(x)
+        
+        if dpb['ref_feature'] is not None:
+            ref_feature = dpb['ref_feature']
+        else:
+            feature_I = F.pixel_unshuffle(dpb["ref_frame"], 8)
+            ref_feature = self.Feature_adaptor_I(feature_I) # 1/8
+            
+        # 3. Add the missing Offset calculation and Alignment
+        offset_hat, offset_latent_q = self.get_offset_enc_dec(ref_feature, feature_8, vector_offset1, vector_offset2)
+        ctx = self.align(ref_feature, offset_hat)
+        
+        # 4. Feature extraction with updated parameters
+        F_tem, F_tem_e = self.feature_extractor(ctx, vector_tem, frame_idx)
+        
+        # 5. Core Encoding
+        y = self.encoder(feature, feature_8, F_tem, vector_enc)
+        z = self.hyper_enc(y)
+        z_scale = z * vector_hyper1
+        z_q = self.quant(z_scale)
+        z_scale_hat = z_q * vector_hyper2
+        hyper_param = self.hyper_dec(z_scale_hat)
+        
+        # 6. Temporal parameter processing
+        if dpb["ref_y"] is not None:
+            ref_y = dpb["ref_y"]
+            tem_param = torch.cat([F_tem_e, ref_y], dim=1)
+        else:
+            indentity = torch.zeros_like(F_tem_e)
+            tem_param = torch.cat([F_tem_e, indentity], dim=1)
+            
+        tem_param = self.temporal_enc(tem_param) # Missing in old code
+        
+        # 7. Prior fusion (Renamed to prior_fusion_1 and chunked to 2)
+        param = self.prior_fusion_1(torch.cat([hyper_param, tem_param], dim=1))
+        scale, mean = param.chunk(2, 1)
+        scale = self.scale_bound(scale.abs())
+        
+        # 8. Residual calculation and quantization
+        y_res = y - mean
+        y_q = self.quant(y_res)
+        y_hat = y_q + mean 
+        
+        # 9. Decoding and Reconstruction
+        F_t = self.decoder(y_hat, F_tem, vector_dec)
+        x_rec = self.recon_frame(F_t, vector_rec) 
+        
+        # 10. Bitstream Encoding (Added offset_latent_q)
+        self.entropy_coder.reset()
+        self.bit_estimator_z.encode(z_q)
+        self.bit_estimator_z.encode(offset_latent_q) # Encode offset
+        self.gaussian_encoder.encode(y_q, scale)
+        self.entropy_coder.flush()
+        
+        bit_stream = self.entropy_coder.get_encoded_stream()
+        
+        result = {
+            "dpb": {
+                "ref_frame": x_rec,
+                "ref_feature": F_t,
+                "ref_feature_L": F_t, # Added to match forward_one_frame exactly
+                "ref_y": y_hat,
+            },
+            "bit_stream": bit_stream,
+        }
+        return result
+
+    def decompress(self, dpb, string, height, width, frame_idx):
+        self.entropy_coder.set_stream(string)
+        dtype = next(self.parameters()).dtype
+        device = next(self.parameters()).device
+        
+        # Offset and Z share the same spatial downsampling factor (1/64)
+        z_size = get_downsampled_shape(height, width, 64)
+        offset_size = get_downsampled_shape(height, width, 64) 
+        
+        # 1. Decode Z and Offset from the bitstream in the same order they were written
+        z_hat = self.bit_estimator_z.decode_stream(z_size, dtype, device)
+        offset_latent_hat_raw = self.bit_estimator_z.decode_stream(offset_size, dtype, device)
+        
+        vector_enc, vector_dec, vector_rec, vector_tem, vector_hyper1, vector_hyper2, vector_offset1, vector_offset2 = self.get_q_for_inference(frame_idx)
+        
+        if dpb['ref_feature'] is not None:
+            ref_feature = dpb['ref_feature']
+        else:
+            feature_I = F.pixel_unshuffle(dpb["ref_frame"], 8)
+            ref_feature = self.Feature_adaptor_I(feature_I)
+            
+        # 2. Reconstruct offset_hat manually (mimicking offset_dec part of get_offset_enc_dec)
+        offset_latent_hat = offset_latent_hat_raw * vector_offset2
+        offset_hat = 6.0 * torch.tanh(self.offset_dec(offset_latent_hat))
+        offset_hat = F.interpolate(offset_hat, scale_factor=2, mode='bilinear')
+        
+        # 3. Apply Local Alignment
+        ctx = self.align(ref_feature, offset_hat)
+        F_tem, F_tem_e = self.feature_extractor(ctx, vector_tem, frame_idx)
+        
+        # 4. Hyper parameters reconstruction
+        z_scale_hat = z_hat * vector_hyper2
+        hyper_param = self.hyper_dec(z_scale_hat)
+        
+        # 5. Temporal parameter processing
+        if dpb["ref_y"] is not None:
+            ref_y = dpb["ref_y"]
+            tem_param = torch.cat([F_tem_e, ref_y], dim=1)
+        else:
+            indentity = torch.zeros_like(F_tem_e)
+            tem_param = torch.cat([F_tem_e, indentity], dim=1)
+            
+        tem_param = self.temporal_enc(tem_param)
+        
+        # 6. Prior fusion and Scale reconstruction
+        param = self.prior_fusion_1(torch.cat([hyper_param, tem_param], dim=1))
+        scale, mean = param.chunk(2, 1)
+        scale = self.scale_bound(scale.abs())
+        
+        # 7. Decode Y
+        y_q = self.gaussian_encoder.decode_stream(scale, dtype, device)
+        y_hat = y_q + mean
+        
+        # 8. Decode Frame
+        F_t = self.decoder(y_hat, F_tem, vector_dec)
+        x_rec = self.recon_frame(F_t, vector_rec)     
+        
+        return {
+            "dpb": {
+                "ref_frame": x_rec,
+                "ref_feature": F_t,
+                "ref_feature_L": F_t,
+                "ref_y": y_hat,
+            }
+        }
 class Multi_DMC(nn.Module):
     def __init__(self,  inplace=False):
         super().__init__()
@@ -501,14 +721,43 @@ class Multi_DMC(nn.Module):
             model_dict.update(load_model_para )
             net.load_state_dict(model_dict, strict = False)
             print(f"Loaded pretrained weights to net{i}")   
-             
-    def forward_one_frame(self, x, dpb, frame_idx=0,use_lip=False):
-        if frame_idx ==0:
-            result = self.net0.forward_one_frame(x, dpb,frame_idx=0, use_lpip = use_lip)
-        elif frame_idx ==2:
-            result = self.net1.forward_one_frame(x, dpb,frame_idx=2, use_lpip = use_lip)
+    def update(self,force = False):
+        self.net0.update(force=force)
+        self.net1.update(force=force)
+        self.net2.update(force=force)
+    def forward_one_frame(self, x, dpb, frame_idx=0, use_lip=False):
+        if frame_idx == 0:
+            result = self.net0.forward_one_frame(x, dpb, frame_idx=0, use_lpip=use_lip)
+            # self.captured_offset = self.net0.captured_offset  # 转发 captured_offset
+        elif frame_idx == 2:
+            result = self.net1.forward_one_frame(x, dpb, frame_idx=2, use_lpip=use_lip)
+            # self.captured_offset = self.net1.captured_offset  # 转发 captured_offset
         else:
-            result = self.net2.forward_one_frame(x, dpb,frame_idx=1, use_lpip = use_lip)
+            result = self.net2.forward_one_frame(x, dpb, frame_idx=1, use_lpip=use_lip)
+            # self.captured_offset = self.net2.captured_offset  # 转发 captured_offset
+        return result
+
+    def encode_decode(self, x, dpb, output_path=None,  pic_width=None, pic_height=None,frame_idx=0,use_lip=False):
+        if frame_idx ==0:
+            result = self.net0.encode_decode(x, dpb,output_path=output_path,
+                      pic_width=pic_width, pic_height=pic_height,frame_idx=0, use_lpip = use_lip)
+        elif frame_idx ==2:
+            result = self.net1.encode_decode(x, dpb,output_path=output_path,
+                      pic_width=pic_width, pic_height=pic_height,frame_idx=2, use_lpip = use_lip)
+        else:
+            result = self.net2.encode_decode(x, dpb,output_path=output_path,
+                      pic_width=pic_width, pic_height=pic_height,frame_idx=1, use_lpip = use_lip)       
+        return result
+    def decode(self, x, dpb, output_path=None,  pic_width=None, pic_height=None,frame_idx=0,use_lip=False):
+        if frame_idx ==0:
+            result = self.net0.decode(x, dpb,output_path=output_path,
+                      pic_width=pic_width, pic_height=pic_height)
+        elif frame_idx ==2:
+            result = self.net1.decode(x, dpb,output_path=output_path,
+                      pic_width=pic_width, pic_height=pic_height)
+        else:
+            result = self.net2.decode(x, dpb,output_path=output_path,
+                      pic_width=pic_width, pic_height=pic_height)       
         return result
     def cal_macs(self):
         result = self.net0.cal_macs()
